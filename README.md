@@ -6,6 +6,12 @@ Aura is a simple weather widget that runs on ESP32-2432S028R ILI9341 devices wit
 
 > **Note:** This project is a fork of [Surrey-Homeware/Aura](https://github.com/Surrey-Homeware/Aura/tree/main/aura).
 
+### Project Screenshots
+
+![Portrait Mode](./Aura/lib/Aura_Portrait.jpg)
+![Landscape Mode](./Aura/lib/Aura_Landscape.jpg)
+![Settings Menu](./Aura/lib/Aura_Settings.jpg)
+
 ### License
 
 You can use the source code here under the terms of the GPL 3.0 license.
