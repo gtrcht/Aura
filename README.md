@@ -1,46 +1,50 @@
 # Aura
 
+Fork of the main project ported on PlatformIO and including a dropdown box to be able to display the screen in Landscape mode.
+
 Aura is a simple weather widget that runs on ESP32-2432S028R ILI9341 devices with a 2.8" screen. These devices are sometimes called a "CYD" or Cheap Yellow Display.
 
-This is just the source code for the project. This project includes a case design and assembly instructions. The complete instructions are available
-here: https://makerworld.com/en/models/1382304-aura-smart-weather-forecast-display
+> **Note:** This project is a fork of [Surrey-Homeware/Aura](https://github.com/Surrey-Homeware/Aura/tree/main/aura).
 
 ### License
 
-You can use the weather.ino code here under the terms of the GPL 3.0 license.
+You can use the source code here under the terms of the GPL 3.0 license.
 
 The icons are not included in that license. See "Thanks" below for details on the icons.
 
-### How to compile:
+### How to compile (PlatformIO):
 
-1. Configure Arduino IDE 
-    1. for "esp32" board with a device type of "ESP32 Dev Module" and
-    1. set "Tools -> Partition Scheme" to "Huge App (3MB No OTA/1MB SPIFFS)"
-1. Install the libraries below in Arduino IDE
-1. Put the source code folders that are in this folder in ~/Documents/Arduino/
-    1. Note the included config files for lvgl and TFT_eSPI need to be dropped in their respective folders
-1. Install and run
+1.  Open the project folder in **VS Code**.
+2.  Install the **PlatformIO IDE** extension.
+3.  PlatformIO will automatically handle library dependencies based on `platformio.ini`.
+4.  Build and upload the project using the PlatformIO toolbar at the bottom of VS Code.
+
+### Configuration & Features
+
+* **Orientation:** This version is specifically optimized for **landscape mode** to provide a better viewing experience for weather data.
+* **Rotation:** You can change the screen orientation directly from the settings menu on the device.
+* **Wi-Fi:** The device will create a temporary access point named "Aura" on the first boot to configure Wi-Fi credentials.
+* **Location:** City locations can be searched and changed via the Aura Settings menu.
 
 ### Libraries required to compile:
 
-- ArduinoJson 7.4.1
-- HttpClient 2.2.0
-- TFT_eSPI 2.5.43_
-- WifiManager 2.0.17
-- XPT2046_Touchscreen 1.4
-- lvgl 9.2.2
+* ArduinoJson
+* HttpClient
+* TFT_eSPI
+* WifiManager
+* XPT2046_Touchscreen
+* lvgl
 
 ### Thanks & Credits
 
-- Weather icons from https://github.com/mrdarrengriffin/google-weather-icons/tree/main/v2
-- Thanks to [lvgl](https://lvgl.io/), a great library for UIs on ESP32 devices that made this much easier
-- Thanks to [witnessmenow](https://github.com/witnessmenow/)'s [CYD Github repo](https://github.com/witnessmenow/ESP32-Cheap-Yellow-Display) for dev board reference information
-- Double thanks to [witnessmenow](https://github.com/witnessmenow/) for the [ESP32 web flashing tutorial](https://github.com/witnessmenow/ESP-Web-Tools-Tutorial)
-- Thanks to [Random Nerd Tutorials](https://randomnerdtutorials.com/) for helpful ESP32 / CYD information, especially with [setting up LVGL](https://randomnerdtutorials.com/esp32-cyd-lvgl-line-chart/)
-- Thanks to these sweet libraries that made this possible:
-	- [ArduinoJson](https://arduinojson.org/)
-	- [HttpClient](https://github.com/amcewen/HttpClient)
-	- [TFT_eSPI](https://github.com/Bodmer/TFT_eSPI)
-	- [WifiManager](https://github.com/tzapu/WiFiManager)
-	- [XPT2046_Touchscreen](https://github.com/PaulStoffregen/XPT2046_Touchscreen)
-	- [lvgl](https://lvgl.io/)
+* Weather icons from https://github.com/mrdarrengriffin/google-weather-icons/tree/main/v2
+* Thanks to [lvgl](https://lvgl.io/), a great library for UIs on ESP32 devices that made this much easier
+* Thanks to [witnessmenow](https://github.com/witnessmenow/)'s [CYD Github repo](https://github.com/witnessmenow/ESP32-Cheap-Yellow-Display) for dev board reference information
+* Thanks to [Random Nerd Tutorials](https://randomnerdtutorials.com/) for helpful ESP32 / CYD information
+* Thanks to these sweet libraries that made this possible:
+    * [ArduinoJson](https://arduinojson.org/)
+    * [HttpClient](https://github.com/amcewen/HttpClient)
+    * [TFT_eSPI](https://github.com/Bodmer/TFT_eSPI)
+    * [WifiManager](https://github.com/tzapu/WiFiManager)
+    * [XPT2046_Touchscreen](https://github.com/PaulStoffregen/XPT2046_Touchscreen)
+    * [lvgl](https://lvgl.io/)
