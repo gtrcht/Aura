@@ -59,8 +59,10 @@ const lv_font_t* get_font_42() {
   return &lv_font_montserrat_latin_42;
 }
 
+TFT_eSPI tft = TFT_eSPI();
 SPIClass touchscreenSPI = SPIClass(VSPI);
 XPT2046_Touchscreen touchscreen(XPT2046_CS, XPT2046_IRQ);
+lv_display_t *disp;
 uint32_t draw_buf[DRAW_BUF_SIZE / 4];
 int x, y, z;
 
@@ -73,7 +75,7 @@ static char latitude[16] = LATITUDE_DEFAULT;
 static char longitude[16] = LONGITUDE_DEFAULT;
 static String location = String(LOCATION_DEFAULT);
 static char dd_opts[512];
-static DynamicJsonDocument geoDoc(8 * 1024);
+static JsonDocument geoDoc;
 static JsonArray geoResults;
 
 // Screen dimming variables
@@ -108,7 +110,9 @@ static lv_obj_t *unit_switch;
 static lv_obj_t *clock_24hr_switch;
 static lv_obj_t *night_mode_switch;
 static lv_obj_t *language_dropdown;
+static lv_obj_t *rotation_dropdown;
 static lv_obj_t *lbl_clock;
+static lv_obj_t *lbl_city;
 
 // Weather icons
 LV_IMG_DECLARE(icon_blizzard);
@@ -173,6 +177,16 @@ static void screen_event_cb(lv_event_t *e);
 static void settings_event_handler(lv_event_t *e);
 const lv_img_dsc_t *choose_image(int wmo_code, int is_day);
 const lv_img_dsc_t *choose_icon(int wmo_code, int is_day);
+void do_geocode_query(const char *q);
+void apModeCallback(WiFiManager *mgr);
+void wifi_splash_screen();
+void hourly_cb(lv_event_t *e);
+void daily_cb(lv_event_t *e);
+static void reset_confirm_yes_cb(lv_event_t *e);
+static void reset_confirm_no_cb(lv_event_t *e);
+static void change_location_event_cb(lv_event_t* e);
+void language_dropdown_event_cb(lv_event_t* e);
+void create_location_dialog();
 
 // Screen dimming functions
 bool night_mode_should_be_active();
@@ -277,11 +291,30 @@ void touchscreen_read(lv_indev_t *indev, lv_indev_data_t *data) {
   if (touchscreen.tirqTouched() && touchscreen.touched()) {
     TS_Point p = touchscreen.getPoint();
 
-    x = map(p.x, 200, 3700, 1, SCREEN_WIDTH);
-    y = map(p.y, 240, 3800, 1, SCREEN_HEIGHT);
-    z = p.z;
+    // Serial.printf("Raw Touch: X=%d, Y=%d\n", p.x, p.y); // Use this for screen calibration
 
-    // Handle touch during dimmed screen
+    // 1. Get raw physical portrait mapping (0-240, 0-320)
+    int16_t x = map(p.x, 200, 3850, 0, 240);
+    int16_t y = map(p.y, 200, 3780, 0, 320);
+
+    // 2. Fix the 180° mismatch for 90/270 logic
+    // We "pre-flip" the coordinates so when the original LVGL lv_display_rotate_point function 
+    // rotates them, they end up in the correct spot.
+    uint32_t rotation = prefs.getUInt("rotation", 0);
+    
+    int16_t finalX = x;
+    int16_t finalY = y;
+
+    if (rotation == 1 || rotation == 3) {
+        // Mirrored landscape fix
+        finalX = 240 - x; 
+        finalY = 320 - y;
+    }
+
+    data->point.x = finalX;
+    data->point.y = finalY;
+
+    // --- YOUR EXISTING NIGHT MODE LOGIC ---
     if (night_mode_active) {
       // Temporarily wake the screen for 15 seconds
       analogWrite(LCD_BACKLIGHT_PIN, prefs.getUInt("brightness", 128));
@@ -291,32 +324,40 @@ void touchscreen_read(lv_indev_t *indev, lv_indev_data_t *data) {
       }
       temp_screen_wakeup_timer = lv_timer_create(handle_temp_screen_wakeup_timeout, 15000, NULL);
       lv_timer_set_repeat_count(temp_screen_wakeup_timer, 1); // Run only once
-      Serial.println("Woke up screen. Setting timer to turn of screen after 15 seconds of inactivity.");
+      Serial.println("Woke up screen. Setting timer to turn off screen after 15 seconds of inactivity.");
 
       if (!temp_screen_wakeup_active) {
-          // If this is the wake-up tap, don't pass this touch to the UI - just undim the screen
+          // If this is the wake-up tap, don't pass this touch to the UI
           temp_screen_wakeup_active = true;
           data->state = LV_INDEV_STATE_RELEASED;
           return;
       }
-
       temp_screen_wakeup_active = true;
     }
+    // --------------------------------------
 
     data->state = LV_INDEV_STATE_PRESSED;
-    data->point.x = x;
-    data->point.y = y;
   } else {
     data->state = LV_INDEV_STATE_RELEASED;
   }
 }
 
 void setup() {
+  // Turn off LED in the back of the board
+  int led_pin[3] = {17, 4, 16};
+  pinMode(led_pin[0], OUTPUT);
+  pinMode(led_pin[1], OUTPUT);
+  pinMode(led_pin[2], OUTPUT);
+  digitalWrite(led_pin[0], HIGH);
+  digitalWrite(led_pin[1], HIGH);
+  digitalWrite(led_pin[2], HIGH);
+
   Serial.begin(115200);
   delay(100);
 
-  TFT_eSPI tft = TFT_eSPI();
   tft.init();
+  // tft.setRotation(1);
+  tft.invertDisplay(true);
   pinMode(LCD_BACKLIGHT_PIN, OUTPUT);
 
   lv_init();
@@ -326,13 +367,19 @@ void setup() {
   touchscreen.begin(touchscreenSPI);
   touchscreen.setRotation(0);
 
-  lv_display_t *disp = lv_tft_espi_create(SCREEN_WIDTH, SCREEN_HEIGHT, draw_buf, sizeof(draw_buf));
+  disp = lv_tft_espi_create(SCREEN_WIDTH, SCREEN_HEIGHT, draw_buf, sizeof(draw_buf));
+
   lv_indev_t *indev = lv_indev_create();
+  lv_indev_set_display(indev, disp);
   lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
   lv_indev_set_read_cb(indev, touchscreen_read);
 
   // Load saved prefs
   prefs.begin("weather", false);
+
+  // uint32_t saved_rotation = prefs.putUInt("rotation", 1); // Force rotation 0: 0°, 1: 90°, 2: 180°, 3: 270°
+  uint32_t saved_rotation = prefs.getUInt("rotation", 0);
+
   String lat = prefs.getString("latitude", LATITUDE_DEFAULT);
   lat.toCharArray(latitude, sizeof(latitude));
   String lon = prefs.getString("longitude", LONGITUDE_DEFAULT);
@@ -386,17 +433,36 @@ void loop() {
 void wifi_splash_screen() {
   lv_obj_t *scr = lv_scr_act();
   lv_obj_clean(scr);
-  lv_obj_set_style_bg_color(scr, lv_color_hex(0x4c8cb9), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_set_style_bg_grad_color(scr, lv_color_hex(0xa6cdec), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_VER, LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+  // Background Styles
+  lv_obj_set_style_bg_color(scr, lv_color_hex(0x4c8cb9), LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_color(scr, lv_color_hex(0xa6cdec), LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_VER, LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+
+  // 1. Get current rotation to decide layout
+  lv_display_t * disp = lv_display_get_default();
+  lv_display_rotation_t rotation = lv_display_get_rotation(disp);
+  bool is_landscape = (rotation == LV_DISPLAY_ROTATION_90 || rotation == LV_DISPLAY_ROTATION_270);
 
   const LocalizedStrings* strings = get_strings(current_language);
   lv_obj_t *lbl = lv_label_create(scr);
   lv_label_set_text(lbl, strings->wifi_config);
-  lv_obj_set_style_text_font(lbl, get_font_14(), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_text_font(lbl, get_font_14(), LV_PART_MAIN);
   lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+
+  // 2. Configure for Word Wrapping
+  // Set width to a percentage of screen to allow wrapping
+  if (is_landscape) {
+    lv_obj_set_width(lbl, lv_pct(70)); // Wider margin for landscape
+  } else {
+    lv_obj_set_width(lbl, lv_pct(90)); // Tighter margin for portrait
+  }
+  lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP); // Enable wrapping
+
+  // 3. Center the object
   lv_obj_center(lbl);
+
   lv_scr_load(scr);
 }
 
@@ -410,9 +476,74 @@ void create_ui() {
   // Trigger settings screen on touch
   lv_obj_add_event_cb(scr, screen_event_cb, LV_EVENT_CLICKED, NULL);
 
+// --- Declare Variable Types ---
+  int16_t icon_today_x, icon_today_y;
+  int16_t lbl_temp_x, lbl_temp_y;
+  int16_t lbl_feels_x, lbl_feels_y;
+  int16_t lbl_forecast_x, lbl_forecast_y;
+  int16_t box_x, box_y, box_w, box_h;
+  int16_t loop_label_left_x, loop_high_right_x, loop_low_right_x, loop_precip_right_x, loop_icon_left_x, line_space_box_y;
+  int16_t lbl_clock_x, lbl_clock_y;
+  int16_t lbl_city_x, lbl_city_y;
+
+  int saved_rotation = prefs.getUInt("rotation", 0); // 0: 0°, 1: 90°, 2: 180°, 3: 270°
+  // -----------------------------------------
+  Serial.printf("Rotation: %d\n", saved_rotation);
+  switch (saved_rotation) {
+    case 1:
+      lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_90);
+      break;
+    case 2:
+      lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_180);
+      break;
+    case 3:
+      lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_270);
+      break;
+    default:
+      lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_0);
+      break;
+  }
+  // -----------------------------------------
+if(saved_rotation == 0 || saved_rotation == 2) {
+    icon_today_x = -64;  icon_today_y = 12;
+    lbl_temp_x = 45;  lbl_temp_y = 25;
+    lbl_feels_x = 45;  lbl_feels_y = 75;
+    lbl_forecast_x = 20;  lbl_forecast_y = 110;
+    box_x = 10; box_y = 135; box_w = 220; box_h = 180;
+    loop_label_left_x = 2;
+    loop_high_right_x = 0;
+    loop_low_right_x = -50;
+    loop_precip_right_x = -55;
+    loop_icon_left_x = 72;
+    line_space_box_y = 24;
+    lbl_clock_x = -10;
+    lbl_clock_y = 2; 
+    lbl_city_x = 10;
+    lbl_city_y = 2; 
+}
+
+if(saved_rotation == 1 || saved_rotation == 3) {
+    icon_today_x = -95;  icon_today_y = 30;
+    lbl_temp_x = -95;  lbl_temp_y = 130;
+    lbl_feels_x = -95;  lbl_feels_y = 180;
+    lbl_forecast_x = 140;  lbl_forecast_y = 30;
+    box_w = 185; box_h = 180;
+    box_x = TFT_HEIGHT-box_w-7; box_y = TFT_WIDTH-box_h-10; 
+    loop_label_left_x = 2;
+    loop_high_right_x = 0;
+    loop_low_right_x = -50;
+    loop_precip_right_x = -55;
+    loop_icon_left_x = 52;
+    line_space_box_y = 24;
+    lbl_clock_x = -10;
+    lbl_clock_y = 2;
+    lbl_city_x = 10;
+    lbl_city_y = 2; 
+  }
+
   img_today_icon = lv_img_create(scr);
   lv_img_set_src(img_today_icon, &image_partly_cloudy);
-  lv_obj_align(img_today_icon, LV_ALIGN_TOP_MID, -64, 4);
+  lv_obj_align(img_today_icon, LV_ALIGN_TOP_MID, icon_today_x, icon_today_y);
 
   static lv_style_t default_label_style;
   lv_style_init(&default_label_style);
@@ -424,24 +555,24 @@ void create_ui() {
   lbl_today_temp = lv_label_create(scr);
   lv_label_set_text(lbl_today_temp, strings->temp_placeholder);
   lv_obj_set_style_text_font(lbl_today_temp, get_font_42(), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_align(lbl_today_temp, LV_ALIGN_TOP_MID, 45, 25);
+  lv_obj_align(lbl_today_temp, LV_ALIGN_TOP_MID, lbl_temp_x, lbl_temp_y);
   lv_obj_add_style(lbl_today_temp, &default_label_style, LV_PART_MAIN | LV_STATE_DEFAULT);
 
   lbl_today_feels_like = lv_label_create(scr);
   lv_label_set_text(lbl_today_feels_like, strings->feels_like_temp);
   lv_obj_set_style_text_font(lbl_today_feels_like, get_font_14(), LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_text_color(lbl_today_feels_like, lv_color_hex(0xe4ffff), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_align(lbl_today_feels_like, LV_ALIGN_TOP_MID, 45, 75);
+  lv_obj_align(lbl_today_feels_like, LV_ALIGN_TOP_MID, lbl_feels_x, lbl_feels_y);
 
   lbl_forecast = lv_label_create(scr);
   lv_label_set_text(lbl_forecast, strings->seven_day_forecast);
   lv_obj_set_style_text_font(lbl_forecast, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_text_color(lbl_forecast, lv_color_hex(0xe4ffff), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_align(lbl_forecast, LV_ALIGN_TOP_LEFT, 20, 110);
+  lv_obj_align(lbl_forecast, LV_ALIGN_TOP_LEFT, lbl_forecast_x, lbl_forecast_y);
 
   box_daily = lv_obj_create(scr);
-  lv_obj_set_size(box_daily, 220, 180);
-  lv_obj_align(box_daily, LV_ALIGN_TOP_LEFT, 10, 135);
+  lv_obj_set_size(box_daily, box_w, box_h);
+  lv_obj_align(box_daily, LV_ALIGN_TOP_LEFT, box_x, box_y);
   lv_obj_set_style_bg_color(box_daily, lv_color_hex(0x5e9bc8), LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_bg_opa(box_daily, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_radius(box_daily, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -460,24 +591,24 @@ void create_ui() {
 
     lv_obj_add_style(lbl_daily_day[i], &default_label_style, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_font(lbl_daily_day[i], get_font_16(), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_align(lbl_daily_day[i], LV_ALIGN_TOP_LEFT, 2, i * 24);
+    lv_obj_align(lbl_daily_day[i], LV_ALIGN_TOP_LEFT, loop_label_left_x, i * line_space_box_y);
 
     lv_obj_add_style(lbl_daily_high[i], &default_label_style, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_font(lbl_daily_high[i], get_font_16(), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_align(lbl_daily_high[i], LV_ALIGN_TOP_RIGHT, 0, i * 24);
+    lv_obj_align(lbl_daily_high[i], LV_ALIGN_TOP_RIGHT, loop_high_right_x, i * line_space_box_y);
 
     lv_label_set_text(lbl_daily_low[i], "");
     lv_obj_set_style_text_color(lbl_daily_low[i], lv_color_hex(0xb9ecff), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_font(lbl_daily_low[i], get_font_16(), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_align(lbl_daily_low[i], LV_ALIGN_TOP_RIGHT, -50, i * 24);
+    lv_obj_align(lbl_daily_low[i], LV_ALIGN_TOP_RIGHT, loop_low_right_x, i * line_space_box_y);
 
     lv_img_set_src(img_daily[i], &icon_partly_cloudy);
-    lv_obj_align(img_daily[i], LV_ALIGN_TOP_LEFT, 72, i * 24);
+    lv_obj_align(img_daily[i], LV_ALIGN_TOP_LEFT, loop_icon_left_x, i * line_space_box_y);
   }
 
   box_hourly = lv_obj_create(scr);
-  lv_obj_set_size(box_hourly, 220, 180);
-  lv_obj_align(box_hourly, LV_ALIGN_TOP_LEFT, 10, 135);
+  lv_obj_set_size(box_hourly, box_w, box_h);
+  lv_obj_align(box_hourly, LV_ALIGN_TOP_LEFT, box_x, box_y);
   lv_obj_set_style_bg_color(box_hourly, lv_color_hex(0x5e9bc8), LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_bg_opa(box_hourly, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_radius(box_hourly, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -496,19 +627,19 @@ void create_ui() {
 
     lv_obj_add_style(lbl_hourly[i], &default_label_style, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_font(lbl_hourly[i], get_font_16(), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_align(lbl_hourly[i], LV_ALIGN_TOP_LEFT, 2, i * 24);
+    lv_obj_align(lbl_hourly[i], LV_ALIGN_TOP_LEFT, loop_label_left_x, i * line_space_box_y);
 
     lv_obj_add_style(lbl_hourly_temp[i], &default_label_style, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_font(lbl_hourly_temp[i], get_font_16(), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_align(lbl_hourly_temp[i], LV_ALIGN_TOP_RIGHT, 0, i * 24);
+    lv_obj_align(lbl_hourly_temp[i], LV_ALIGN_TOP_RIGHT, loop_high_right_x, i * line_space_box_y);
 
     lv_label_set_text(lbl_precipitation_probability[i], "");
     lv_obj_set_style_text_color(lbl_precipitation_probability[i], lv_color_hex(0xb9ecff), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_font(lbl_precipitation_probability[i], get_font_16(), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_align(lbl_precipitation_probability[i], LV_ALIGN_TOP_RIGHT, -55, i * 24);
+    lv_obj_align(lbl_precipitation_probability[i], LV_ALIGN_TOP_RIGHT, loop_precip_right_x, i * line_space_box_y);
 
     lv_img_set_src(img_hourly[i], &icon_partly_cloudy);
-    lv_obj_align(img_hourly[i], LV_ALIGN_TOP_LEFT, 72, i * 24);
+    lv_obj_align(img_hourly[i], LV_ALIGN_TOP_LEFT, loop_icon_left_x, i * line_space_box_y);
   }
 
   lv_obj_add_flag(box_hourly, LV_OBJ_FLAG_HIDDEN);
@@ -518,7 +649,18 @@ void create_ui() {
   lv_obj_set_style_text_font(lbl_clock, get_font_14(), LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_text_color(lbl_clock, lv_color_hex(0xb9ecff), LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_label_set_text(lbl_clock, "");
-  lv_obj_align(lbl_clock, LV_ALIGN_TOP_RIGHT, -10, 2);
+  lv_obj_align(lbl_clock, LV_ALIGN_TOP_RIGHT, lbl_clock_x, lbl_clock_y);
+
+  // Create City label in the top-left corner
+  lbl_city = lv_label_create(scr);
+  lv_obj_set_style_text_font(lbl_city, get_font_14(), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_text_color(lbl_city, lv_color_hex(0xb9ecff), LV_PART_MAIN | LV_STATE_DEFAULT);
+  String location = prefs.getString("location", "");
+  int comma_index = location.indexOf(','); // find the first comma
+  if(comma_index != -1) location = location.substring(0, comma_index); // take text before comma
+  lv_label_set_text(lbl_city, location.c_str());
+
+  lv_obj_align(lbl_city, LV_ALIGN_TOP_LEFT, lbl_city_x, lbl_city_y);
 }
 
 void populate_results_dropdown() {
@@ -535,6 +677,10 @@ void populate_results_dropdown() {
 
   if (geoResults.size() > 0) {
     lv_dropdown_set_options_static(results_dd, dd_opts);
+    lv_obj_t * list = lv_dropdown_get_list(results_dd);
+    lv_obj_set_style_width(list, lv_obj_get_width(results_dd), LV_PART_MAIN);
+    lv_obj_set_width(list, lv_obj_get_width(results_dd));
+    lv_obj_set_style_max_width(list, lv_obj_get_width(results_dd), LV_PART_MAIN);
     lv_obj_add_flag(results_dd, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_style_bg_color(btn_close_loc, lv_palette_main(LV_PALETTE_GREEN), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_opa(btn_close_loc, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -610,10 +756,9 @@ static void reset_wifi_event_handler(lv_event_t *e) {
 
   lv_obj_t *text = lv_msgbox_add_text(mbox, strings->reset_confirmation);
   lv_obj_set_style_text_font(text, get_font_12(), 0);
-  lv_msgbox_add_close_button(mbox);
+  lv_obj_t *msgbox_close_btn = lv_msgbox_add_close_button(mbox);
+  lv_obj_align(msgbox_close_btn, LV_ALIGN_TOP_RIGHT, -5, 5);
 
-  lv_obj_t *btn_no = lv_msgbox_add_footer_button(mbox, strings->cancel);
-  lv_obj_set_style_text_font(btn_no, get_font_12(), 0);
   lv_obj_t *btn_yes = lv_msgbox_add_footer_button(mbox, strings->reset);
   lv_obj_set_style_text_font(btn_yes, get_font_12(), 0);
 
@@ -630,7 +775,6 @@ static void reset_wifi_event_handler(lv_event_t *e) {
   lv_obj_set_style_radius(mbox, 4, LV_PART_MAIN);
 
   lv_obj_add_event_cb(btn_yes, reset_confirm_yes_cb, LV_EVENT_CLICKED, mbox);
-  lv_obj_add_event_cb(btn_no, reset_confirm_no_cb, LV_EVENT_CLICKED, mbox);
 }
 
 static void reset_confirm_yes_cb(lv_event_t *e) {
@@ -655,51 +799,112 @@ static void change_location_event_cb(lv_event_t *e) {
 
 void create_location_dialog() {
   const LocalizedStrings* strings = get_strings(current_language);
+
+  // 1. Get current rotation
+  lv_display_t * disp = lv_display_get_default();
+  lv_display_rotation_t rotation = lv_display_get_rotation(disp);
+  bool is_landscape = (rotation == LV_DISPLAY_ROTATION_90 || rotation == LV_DISPLAY_ROTATION_270);
+
+  // ==========================================
+  // ============ LAYOUT CONFIGURATION ========
+  // ==========================================                
+  // Dimensions
+  int16_t win_width = is_landscape ? 320 : 240;
+  int16_t win_height = is_landscape ? 240 : 320;
+  
+  // Spacing / Margins
+  int16_t pad_outer_x = 10, pad_outer_y = 15;
+  int16_t row_space = 10;
+  // ==========================================
+
   location_win = lv_win_create(lv_scr_act());
-  lv_obj_t *title = lv_win_add_title(location_win, strings->change_location);
-  lv_obj_t *header = lv_win_get_header(location_win);
-  lv_obj_set_style_height(header, 30, 0);
-  lv_obj_set_style_text_font(title, get_font_16(), 0);
-  lv_obj_set_style_margin_left(title, 10, 0);
-  lv_obj_set_size(location_win, 240, 320);
+  lv_obj_set_size(location_win, win_width, win_height);
   lv_obj_center(location_win);
 
-  lv_obj_t *cont = lv_win_get_content(location_win);
+  lv_obj_t *header = lv_win_get_header(location_win);
+  lv_obj_set_style_height(header, 30, 0);
 
+  lv_obj_t *title = lv_win_add_title(location_win, strings->change_location);
+  lv_obj_set_style_text_font(title, get_font_16(), 0);
+  lv_obj_set_width(title, lv_pct(100));
+  lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_LEFT, 0);
+  lv_obj_set_style_pad_left(title, 5, 0);
+
+  // --- ADDED X BUTTON TO TOP RIGHT OF HEADER ---                
+  lv_obj_t *btn_x = lv_btn_create(header);                
+  lv_obj_set_size(btn_x, 24, 24);
+  lv_obj_align(btn_x, LV_ALIGN_RIGHT_MID, -5, 0);
+  lv_obj_add_event_cb(btn_x, location_cancel_event_cb, LV_EVENT_CLICKED, &geoResults);                
+
+  lv_obj_t *x_sym = lv_label_create(btn_x);                
+  lv_label_set_text(x_sym, LV_SYMBOL_CLOSE);                
+  lv_obj_center(x_sym);
+  // ---------------------------------------------
+
+  lv_obj_t *cont = lv_win_get_content(location_win);
+  // Remove padding to have control over positioning
+  lv_obj_set_style_pad_all(cont, 0, 0);                
+
+  // --- UI Elements ---
+
+  // City Label
   lv_obj_t *lbl = lv_label_create(cont);
   lv_label_set_text(lbl, strings->city);
+  lv_obj_set_height(lbl, LV_SIZE_CONTENT);
   lv_obj_set_style_text_font(lbl, get_font_14(), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 5, 10);
+  lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, pad_outer_x, pad_outer_y);
 
+  // TextArea
   loc_ta = lv_textarea_create(cont);
   lv_textarea_set_one_line(loc_ta, true);
+  lv_obj_set_scrollbar_mode(loc_ta, LV_SCROLLBAR_MODE_OFF);
   lv_textarea_set_placeholder_text(loc_ta, strings->city_placeholder);
-  lv_obj_set_width(loc_ta, 170);
-  lv_obj_align_to(loc_ta, lbl, LV_ALIGN_OUT_RIGHT_MID, 5, 0);
+  lv_obj_set_style_text_font(loc_ta, get_font_14(), 0);
+  lv_obj_set_height(loc_ta, lv_font_get_line_height(get_font_14()) + 8);
+  lv_obj_set_width(loc_ta, lv_obj_get_width(cont) - lv_obj_get_width(lbl) - pad_outer_x * 3);
+  lv_obj_align_to(loc_ta, lbl, LV_ALIGN_OUT_RIGHT_MID, pad_outer_x, 0);
+  lv_obj_set_style_pad_top(loc_ta, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(loc_ta, 0, LV_PART_MAIN);
 
   lv_obj_add_event_cb(loc_ta, ta_event_cb, LV_EVENT_CLICKED, kb);
   lv_obj_add_event_cb(loc_ta, ta_defocus_cb, LV_EVENT_DEFOCUSED, kb);
 
+  // Results Label
   lv_obj_t *lbl2 = lv_label_create(cont);
   lv_label_set_text(lbl2, strings->search_results);
   lv_obj_set_style_text_font(lbl2, get_font_14(), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_align(lbl2, LV_ALIGN_TOP_LEFT, 5, 50);
+  lv_obj_align_to(lbl2, lbl, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 10); // Positioned relative to lbl
 
+  // Dropdown
   results_dd = lv_dropdown_create(cont);
-  lv_obj_set_width(results_dd, 200);
-  lv_obj_align(results_dd, LV_ALIGN_TOP_LEFT, 5, 70);
+  lv_obj_set_width(results_dd, lv_obj_get_width(cont) - pad_outer_x * 2);
+  lv_obj_set_style_text_font(results_dd, get_font_14(), 0);
+  lv_obj_set_height(results_dd, lv_font_get_line_height(get_font_14()) + 8);
+  lv_obj_set_style_max_width(results_dd, lv_obj_get_width(cont) - pad_outer_x * 2, LV_PART_ITEMS);
+  lv_obj_align_to(results_dd, lbl2, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 0);
   lv_obj_set_style_text_font(results_dd, get_font_14(), LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_text_font(results_dd, get_font_14(), LV_PART_SELECTED | LV_STATE_DEFAULT);
-
+  lv_obj_set_style_pad_top(results_dd, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(results_dd, 0, LV_PART_MAIN);
   lv_obj_t *list = lv_dropdown_get_list(results_dd);
+  lv_obj_set_style_pad_top(list, 0, 0); // compact list style
+  lv_obj_set_style_pad_bottom(list, 0, 0);
+  lv_obj_set_style_pad_row(list, 0, 0);
+  lv_obj_set_style_text_line_space(list, 0, 0);
+
   lv_obj_set_style_text_font(list, get_font_14(), LV_PART_MAIN | LV_STATE_DEFAULT);
 
   lv_dropdown_set_options(results_dd, "");
+  lv_obj_set_style_clip_corner(list, true, 0);
+  lv_obj_set_width(list, lv_obj_get_width(results_dd));
+  lv_obj_set_style_width(list, lv_obj_get_width(results_dd), LV_PART_MAIN);
+  lv_obj_set_style_max_width(list, lv_obj_get_width(results_dd), LV_PART_MAIN);
   lv_obj_clear_flag(results_dd, LV_OBJ_FLAG_CLICKABLE);
 
+  // --- SAVE BUTTON (REPLACED CANCEL) ---
   btn_close_loc = lv_btn_create(cont);
-  lv_obj_set_size(btn_close_loc, 80, 40);
-  lv_obj_align(btn_close_loc, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+  lv_obj_set_size(btn_close_loc, 150, 40);
+  lv_obj_align(btn_close_loc, LV_ALIGN_BOTTOM_RIGHT, -5, -5);
 
   lv_obj_add_event_cb(btn_close_loc, location_save_event_cb, LV_EVENT_CLICKED, &geoResults);
   lv_obj_set_style_bg_color(btn_close_loc, lv_palette_main(LV_PALETTE_GREY), LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -711,176 +916,224 @@ void create_location_dialog() {
   lv_label_set_text(lbl_close, strings->save);
   lv_obj_set_style_text_font(lbl_close, get_font_14(), LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_center(lbl_close);
-
-  lv_obj_t *btn_cancel_loc = lv_btn_create(cont);
-  lv_obj_set_size(btn_cancel_loc, 80, 40);
-  lv_obj_align_to(btn_cancel_loc, btn_close_loc, LV_ALIGN_OUT_LEFT_MID, -5, 0);
-  lv_obj_add_event_cb(btn_cancel_loc, location_cancel_event_cb, LV_EVENT_CLICKED, &geoResults);
-
-  lv_obj_t *lbl_cancel = lv_label_create(btn_cancel_loc);
-  lv_label_set_text(lbl_cancel, strings->cancel);
-  lv_obj_set_style_text_font(lbl_cancel, get_font_14(), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_center(lbl_cancel);
 }
 
 void create_settings_window() {
   if (settings_win) return;
 
-  int vertical_element_spacing = 21;
-
   const LocalizedStrings* strings = get_strings(current_language);
+
+  // 1. Get current rotation
+  lv_display_t * disp = lv_display_get_default();
+  lv_display_rotation_t rotation = lv_display_get_rotation(disp);
+  bool is_landscape = (rotation == LV_DISPLAY_ROTATION_90 || rotation == LV_DISPLAY_ROTATION_270);
+
+  // ==========================================
+  // ============ LAYOUT CONFIGURATION ========
+  // ==========================================
+   // Font Sizes
+  const lv_font_t* font_small = get_font_12();
+  const lv_font_t* font_med = get_font_16(); 
+
+  // Dimensions
+  int16_t win_width = is_landscape ? 320 : 240;
+  int16_t win_height = is_landscape ? 240 : 320;
+  
+  // Spacing
+  int16_t v_space = is_landscape ? 10 : 16;    // Vertical space between rows
+  int16_t h_space = 10;                        // Horizontal space between labels and inputs
+  int16_t pad_outer_x = 15;                    // Padding inside window edge
+  int16_t pad_outer_y = is_landscape ? 8 : 15;
+
+  // Object Sizes
+  int16_t btn_w = is_landscape ? 140 : 100;
+  int16_t btn_h = 35;
+  int16_t slider_w = is_landscape ? 150 : 100;
+  int16_t drop_w = 120;
+  int16_t switch_w = 40, switch_h = 20; 
+  int16_t lbl_h = lv_font_get_line_height(font_small);
+
+  // ==========================================
+
+  // 2. Create Window
   settings_win = lv_win_create(lv_scr_act());
+  lv_obj_set_size(settings_win, win_width, win_height);
+  lv_obj_center(settings_win);
 
   lv_obj_t *header = lv_win_get_header(settings_win);
   lv_obj_set_style_height(header, 30, 0);
 
   lv_obj_t *title = lv_win_add_title(settings_win, strings->aura_settings);
-  lv_obj_set_style_text_font(title, get_font_16(), 0);
-  lv_obj_set_style_margin_left(title, 10, 0);
+  lv_obj_set_style_text_font(title, font_med, 0);
+  lv_obj_set_width(title, lv_pct(100));
+  lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_LEFT, 0);
+  lv_obj_set_style_pad_left(title, pad_outer_x, 0);
 
-  lv_obj_center(settings_win);
-  lv_obj_set_width(settings_win, 240);
+  // Create button inside the header
+  btn_close_obj = lv_btn_create(header);                
+  lv_obj_set_size(btn_close_obj, 24, 24);
+  // Position it top right
+  lv_obj_align(btn_close_obj, LV_ALIGN_RIGHT_MID, -5, 0);
+  lv_obj_add_event_cb(btn_close_obj, settings_event_handler, LV_EVENT_CLICKED, NULL);                
+
+  // Add symbol to button
+  lv_obj_t *close_sym = lv_label_create(btn_close_obj);                
+  lv_label_set_text(close_sym, LV_SYMBOL_CLOSE);                
+  lv_obj_center(close_sym);
 
   lv_obj_t *cont = lv_win_get_content(settings_win);
+  lv_obj_set_style_pad_all(cont, 0, 0); // Remove padding around the edge
+  lv_obj_set_style_pad_gap(cont, 0, 0); // Remove default gaps between children
 
-  // Brightness
+  // --- UI Elements ---
+
+  // 1. Brightness
   lv_obj_t *lbl_b = lv_label_create(cont);
   lv_label_set_text(lbl_b, strings->brightness);
-  lv_obj_set_style_text_font(lbl_b, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_align(lbl_b, LV_ALIGN_TOP_LEFT, 0, 5);
+  lv_obj_set_style_text_font(lbl_b, font_small, 0);
+  lv_obj_set_height(lbl_b, lbl_h);
+  lv_obj_align(lbl_b, LV_ALIGN_TOP_LEFT, pad_outer_x, pad_outer_y);
+  lv_obj_set_style_text_align(lbl_b, LV_TEXT_ALIGN_CENTER, 0); // Center text vertically
+
   lv_obj_t *slider = lv_slider_create(cont);
   lv_slider_set_range(slider, 1, 255);
-  uint32_t saved_b = prefs.getUInt("brightness", 128);
-  lv_slider_set_value(slider, saved_b, LV_ANIM_OFF);
-  lv_obj_set_width(slider, 100);
-  lv_obj_align_to(slider, lbl_b, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
-
+  lv_slider_set_value(slider, prefs.getUInt("brightness", 128), LV_ANIM_OFF);
+  lv_obj_set_width(slider, slider_w);
+  lv_obj_align_to(slider, lbl_b, LV_ALIGN_OUT_RIGHT_MID, h_space, 0);
+  
   lv_obj_add_event_cb(slider, [](lv_event_t *e){
-    lv_obj_t *s = (lv_obj_t*)lv_event_get_target(e);
-    uint32_t v = lv_slider_get_value(s);
+    lv_obj_t *s = (lv_obj_t *)lv_event_get_target(e);
+    int32_t v = lv_slider_get_value(s);
     analogWrite(LCD_BACKLIGHT_PIN, v);
     prefs.putUInt("brightness", v);
   }, LV_EVENT_VALUE_CHANGED, NULL);
 
-  // 'Night mode' switch
+  // 2. 'Night mode' switch
   lv_obj_t *lbl_night_mode = lv_label_create(cont);
   lv_label_set_text(lbl_night_mode, strings->use_night_mode);
-  lv_obj_set_style_text_font(lbl_night_mode, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_align_to(lbl_night_mode, lbl_b, LV_ALIGN_OUT_BOTTOM_LEFT, 0, vertical_element_spacing);
+  lv_obj_set_style_text_font(lbl_night_mode, font_small, 0);
+  lv_obj_set_height(lbl_night_mode, lbl_h); // FIXED
+  lv_obj_align_to(lbl_night_mode, lbl_b, LV_ALIGN_OUT_BOTTOM_LEFT, 0, v_space);
 
   night_mode_switch = lv_switch_create(cont);
+  lv_obj_set_size(night_mode_switch, switch_w, switch_h);
   lv_obj_align_to(night_mode_switch, lbl_night_mode, LV_ALIGN_OUT_RIGHT_MID, 6, 0);
-  if (use_night_mode) {
-    lv_obj_add_state(night_mode_switch, LV_STATE_CHECKED);
-  } else {
-    lv_obj_remove_state(night_mode_switch, LV_STATE_CHECKED);
-  }
+  if (use_night_mode) lv_obj_add_state(night_mode_switch, LV_STATE_CHECKED);
   lv_obj_add_event_cb(night_mode_switch, settings_event_handler, LV_EVENT_VALUE_CHANGED, NULL);
 
-  // 'Use F' switch
+  // 3. 'Use F' switch
   lv_obj_t *lbl_u = lv_label_create(cont);
   lv_label_set_text(lbl_u, strings->use_fahrenheit);
-  lv_obj_set_style_text_font(lbl_u, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_align_to(lbl_u, lbl_night_mode, LV_ALIGN_OUT_BOTTOM_LEFT, 0, vertical_element_spacing);
+  lv_obj_set_style_text_font(lbl_u, font_small, 0);
+  lv_obj_set_height(lbl_u, lbl_h); // FIXED
+  lv_obj_align_to(lbl_u, lbl_night_mode, LV_ALIGN_OUT_BOTTOM_LEFT, 0, v_space);
 
   unit_switch = lv_switch_create(cont);
+  lv_obj_set_size(unit_switch, switch_w, switch_h);
   lv_obj_align_to(unit_switch, lbl_u, LV_ALIGN_OUT_RIGHT_MID, 6, 0);
-  if (use_fahrenheit) {
-    lv_obj_add_state(unit_switch, LV_STATE_CHECKED);
-  } else {
-    lv_obj_remove_state(unit_switch, LV_STATE_CHECKED);
-  }
+  if (use_fahrenheit) lv_obj_add_state(unit_switch, LV_STATE_CHECKED);
   lv_obj_add_event_cb(unit_switch, settings_event_handler, LV_EVENT_VALUE_CHANGED, NULL);
 
-  // 24-hr time switch
+  // 4. 24-hr time switch
   lv_obj_t *lbl_24hr = lv_label_create(cont);
   lv_label_set_text(lbl_24hr, strings->use_24hr);
-  lv_obj_set_style_text_font(lbl_24hr, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_align_to(lbl_24hr, unit_switch, LV_ALIGN_OUT_RIGHT_MID, 6, 0);
+  lv_obj_set_style_text_font(lbl_24hr, font_small, 0);
+  lv_obj_set_height (lbl_24hr, lbl_h); // FIXED
+  lv_obj_align_to(lbl_24hr, unit_switch, LV_ALIGN_OUT_RIGHT_MID, h_space, 0);
 
   clock_24hr_switch = lv_switch_create(cont);
+  lv_obj_set_size(clock_24hr_switch, switch_w, switch_h);
   lv_obj_align_to(clock_24hr_switch, lbl_24hr, LV_ALIGN_OUT_RIGHT_MID, 6, 0);
-  if (use_24_hour) {
-    lv_obj_add_state(clock_24hr_switch, LV_STATE_CHECKED);
-  } else {
-    lv_obj_clear_state(clock_24hr_switch, LV_STATE_CHECKED);
-  }
+  if (use_24_hour) lv_obj_add_state(clock_24hr_switch, LV_STATE_CHECKED);
   lv_obj_add_event_cb(clock_24hr_switch, settings_event_handler, LV_EVENT_VALUE_CHANGED, NULL);
 
-  // Current Location label
-  lv_obj_t *lbl_loc_l = lv_label_create(cont);
-  lv_label_set_text(lbl_loc_l, strings->location);
-  lv_obj_set_style_text_font(lbl_loc_l, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_align_to(lbl_loc_l, lbl_u, LV_ALIGN_OUT_BOTTOM_LEFT, 0, vertical_element_spacing);
+  // 5. Rotation label
+  lv_obj_t *lbl_rot = lv_label_create(cont);
+  lv_label_set_text(lbl_rot, strings->rotation);
+  lv_obj_set_style_text_font(lbl_rot, font_small, 0);
+  lv_obj_set_height(lbl_rot, lbl_h); // FIXED
+  
+  lv_obj_align_to(lbl_rot, lbl_u, LV_ALIGN_OUT_BOTTOM_LEFT, 0, v_space);
 
-  lbl_loc = lv_label_create(cont);
-  lv_label_set_text(lbl_loc, location.c_str());
-  lv_obj_set_style_text_font(lbl_loc, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_align_to(lbl_loc, lbl_loc_l, LV_ALIGN_OUT_RIGHT_MID, 5, 0);
+  // Rotation dropdown
+  rotation_dropdown = lv_dropdown_create(cont);
+  lv_dropdown_set_options(rotation_dropdown, "0°\n90°\n180°\n270°");
+  lv_dropdown_set_selected(rotation_dropdown, prefs.getUInt("rotation", 0));
+  lv_obj_set_width(rotation_dropdown, drop_w);
+  lv_obj_set_style_pad_top(rotation_dropdown, 2, LV_PART_MAIN); 
+  lv_obj_set_style_pad_bottom(rotation_dropdown, 2, LV_PART_MAIN); 
+  lv_obj_set_style_text_font(rotation_dropdown, font_small, 0);
+  lv_obj_align_to(rotation_dropdown, lbl_rot, LV_ALIGN_OUT_RIGHT_MID, h_space, 0);
+  lv_obj_add_event_cb(rotation_dropdown, settings_event_handler, LV_EVENT_VALUE_CHANGED, NULL);
+  lv_obj_t * rot_list = lv_dropdown_get_list(rotation_dropdown);
+  lv_obj_set_style_text_font(rot_list, font_small, 0);
+  lv_obj_set_style_clip_corner(rot_list, true, 0);
+  lv_obj_set_style_pad_top(rot_list, 0, 0); // compact list style
+  lv_obj_set_style_pad_bottom(rot_list, 0, 0);
+  lv_obj_set_style_pad_row(rot_list, 0, 0);
+  lv_obj_set_style_text_line_space(rot_list, 0, 0);
 
-  // Language selection
+  // 6. Language selection
   lv_obj_t *lbl_lang = lv_label_create(cont);
   lv_label_set_text(lbl_lang, strings->language_label);
-  lv_obj_set_style_text_font(lbl_lang, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_align_to(lbl_lang, lbl_loc_l, LV_ALIGN_OUT_BOTTOM_LEFT, 0, vertical_element_spacing);
+  lv_obj_set_style_text_font(lbl_lang, font_small, 0);
+  lv_obj_set_height(lbl_lang, lbl_h); // FIXED
+  lv_obj_align_to(lbl_lang, lbl_rot, LV_ALIGN_OUT_BOTTOM_LEFT, 0, v_space);
 
   language_dropdown = lv_dropdown_create(cont);
   lv_dropdown_set_options(language_dropdown, "English\nEspañol\nDeutsch\nFrançais\nTürkçe\nSvenska\nItaliano");
   lv_dropdown_set_selected(language_dropdown, current_language);
-  lv_obj_set_width(language_dropdown, 120);
-  lv_obj_set_style_text_font(language_dropdown, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_set_style_text_font(language_dropdown, get_font_12(), LV_PART_SELECTED | LV_STATE_DEFAULT);
-  lv_obj_t *list = lv_dropdown_get_list(language_dropdown);
-  lv_obj_set_style_text_font(list, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_align_to(language_dropdown, lbl_lang, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
+  lv_obj_set_width(language_dropdown, drop_w);
+  lv_obj_set_style_pad_top(language_dropdown, 2, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(language_dropdown, 2, LV_PART_MAIN);
+  lv_obj_align_to(language_dropdown, lbl_lang, LV_ALIGN_OUT_RIGHT_MID, h_space, 0);
   lv_obj_add_event_cb(language_dropdown, settings_event_handler, LV_EVENT_VALUE_CHANGED, NULL);
+  lv_obj_set_style_text_font(language_dropdown, font_small, 0);
+  lv_obj_t * list = lv_dropdown_get_list(language_dropdown);
+  lv_obj_set_style_text_font(list, font_small, 0);
+  lv_obj_set_style_clip_corner(list, true, 0);
+  lv_obj_set_style_pad_top(list, 0, 0); // compact list style
+  lv_obj_set_style_pad_bottom(list, 0, 0);
+  lv_obj_set_style_pad_row(list, 0, 0);
+  lv_obj_set_style_text_line_space(list, 0, 0);
 
-  // Location search button
+  // 7. Location search button
   lv_obj_t *btn_change_loc = lv_btn_create(cont);
-  lv_obj_align_to(btn_change_loc, lbl_lang, LV_ALIGN_OUT_BOTTOM_LEFT, 0, vertical_element_spacing);
-
-  lv_obj_set_size(btn_change_loc, 100, 40);
+  lv_obj_set_size(btn_change_loc, btn_w, btn_h);
+  lv_obj_align_to(btn_change_loc, lbl_lang, LV_ALIGN_OUT_BOTTOM_LEFT, 0, v_space);
   lv_obj_add_event_cb(btn_change_loc, change_location_event_cb, LV_EVENT_CLICKED, NULL);
   lv_obj_t *lbl_chg = lv_label_create(btn_change_loc);
   lv_label_set_text(lbl_chg, strings->location_btn);
-  lv_obj_set_style_text_font(lbl_chg, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_text_font(lbl_chg, font_med, 0);
   lv_obj_center(lbl_chg);
 
-  // Hidden keyboard object
+  // Current location label below the button
+  lbl_loc = lv_label_create(cont);
+  lv_label_set_text(lbl_loc, location.c_str());
+  lv_obj_set_style_text_font(lbl_loc, font_small, 0);
+  lv_obj_set_height(lbl_loc, lbl_h); // FIXED
+  lv_obj_align_to(lbl_loc, btn_change_loc, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 5);
+
+  // 8. Reset WiFi button
+  lv_obj_t *btn_reset = lv_btn_create(cont);
+  lv_obj_set_style_bg_color(btn_reset, lv_palette_main(LV_PALETTE_RED), 0);
+  lv_obj_set_size(btn_reset, btn_w, btn_h);
+  lv_obj_align_to(btn_reset, btn_change_loc, LV_ALIGN_OUT_RIGHT_MID, 12, 0);
+  lv_obj_add_event_cb(btn_reset, reset_wifi_event_handler, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t *lbl_reset = lv_label_create(btn_reset);
+  lv_label_set_text(lbl_reset, strings->reset_wifi);
+  lv_obj_set_style_text_font(lbl_reset, font_med, 0);
+  lv_obj_center(lbl_reset);
+
+  // 9. Hidden keyboard object
   if (!kb) {
-    kb = lv_keyboard_create(lv_scr_act());
-    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+    kb = lv_keyboard_create(lv_scr_act());                
     lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    lv_buttonmatrix_set_button_ctrl(kb, 12, LV_BUTTONMATRIX_CTRL_HIDDEN); // Hide ABC
+    lv_buttonmatrix_set_button_ctrl(kb, 22, LV_BUTTONMATRIX_CTRL_HIDDEN); // Hide new line
     lv_obj_add_event_cb(kb, kb_event_cb, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(kb, kb_event_cb, LV_EVENT_CANCEL, NULL);
   }
-
-  // Reset WiFi button
-  lv_obj_t *btn_reset = lv_btn_create(cont);
-  lv_obj_set_style_bg_color(btn_reset, lv_palette_main(LV_PALETTE_RED), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_set_style_bg_color(btn_reset, lv_palette_darken(LV_PALETTE_RED, 1), LV_PART_MAIN | LV_STATE_PRESSED);
-  lv_obj_set_style_text_color(btn_reset, lv_color_white(), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_set_size(btn_reset, 100, 40);
-  lv_obj_align_to(btn_reset, btn_change_loc, LV_ALIGN_OUT_RIGHT_MID, 12, 0);
-
-  lv_obj_add_event_cb(btn_reset, reset_wifi_event_handler, LV_EVENT_CLICKED, nullptr);
-
-  lv_obj_t *lbl_reset = lv_label_create(btn_reset);
-  lv_label_set_text(lbl_reset, strings->reset_wifi);
-  lv_obj_set_style_text_font(lbl_reset, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_center(lbl_reset);
-
-  // Close Settings button
-  btn_close_obj = lv_btn_create(cont);
-  lv_obj_set_size(btn_close_obj, 80, 40);
-  lv_obj_align(btn_close_obj, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
-  lv_obj_add_event_cb(btn_close_obj, settings_event_handler, LV_EVENT_CLICKED, NULL);
-
-  // Cancel button
-  lv_obj_t *lbl_btn = lv_label_create(btn_close_obj);
-  lv_label_set_text(lbl_btn, strings->close);
-  lv_obj_set_style_text_font(lbl_btn, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_center(lbl_btn);
 }
 
 static void settings_event_handler(lv_event_t *e) {
@@ -899,6 +1152,19 @@ static void settings_event_handler(lv_event_t *e) {
     use_night_mode = lv_obj_has_state(night_mode_switch, LV_STATE_CHECKED);
   }
 
+
+  // Handle rotation dropdown change
+  if (tgt == rotation_dropdown && code == LV_EVENT_VALUE_CHANGED) {
+    int selected = lv_dropdown_get_selected(rotation_dropdown);
+    prefs.putUInt("rotation", selected);
+    lv_obj_del(settings_win);
+    settings_win = nullptr;
+    lv_obj_clean(lv_scr_act());
+    create_ui();
+    fetch_and_update_weather();
+    return;
+  }
+
   if (tgt == language_dropdown && code == LV_EVENT_VALUE_CHANGED) {
     current_language = (Language)lv_dropdown_get_selected(language_dropdown);
     // Update the UI immediately to reflect language change
@@ -911,8 +1177,10 @@ static void settings_event_handler(lv_event_t *e) {
     prefs.putBool("useNightMode", use_night_mode);
     prefs.putUInt("language", current_language);
 
-    lv_keyboard_set_textarea(kb, nullptr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    if (kb) {
+        lv_keyboard_set_textarea(kb, nullptr);
+        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    }
     
     // Recreate the main UI with the new language
     lv_obj_clean(lv_scr_act());
@@ -927,8 +1195,12 @@ static void settings_event_handler(lv_event_t *e) {
     prefs.putBool("useNightMode", use_night_mode);
     prefs.putUInt("language", current_language);
 
-    lv_keyboard_set_textarea(kb, nullptr);
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    // Check if kb exists, break its link, then delete it.
+    if (kb != nullptr) {
+        lv_keyboard_set_textarea(kb, nullptr); // Important: break link first!
+        lv_obj_del(kb); // Free the memory
+        kb = nullptr; // Reset the pointer to prevent reuse
+    }
 
     lv_obj_del(settings_win);
     settings_win = nullptr;
@@ -1034,7 +1306,7 @@ void fetch_and_update_weather() {
     Serial.println("Updated weather from open-meteo: " + url);
 
     String payload = http.getString();
-    DynamicJsonDocument doc(32 * 1024);
+    JsonDocument doc;
 
     if (deserializeJson(doc, payload) == DeserializationError::Ok) {
       float t_now = doc["current"]["temperature_2m"].as<float>();
