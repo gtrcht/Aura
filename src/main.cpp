@@ -77,6 +77,7 @@ static String location = String(LOCATION_DEFAULT);
 static char dd_opts[512];
 static JsonDocument geoDoc;
 static JsonArray geoResults;
+static String location_ui;
 
 // Screen dimming variables
 static bool night_mode_active = false;
@@ -655,10 +656,10 @@ if(saved_rotation == 1 || saved_rotation == 3) {
   lbl_city = lv_label_create(scr);
   lv_obj_set_style_text_font(lbl_city, get_font_14(), LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_text_color(lbl_city, lv_color_hex(0xb9ecff), LV_PART_MAIN | LV_STATE_DEFAULT);
-  String location = prefs.getString("location", "");
-  int comma_index = location.indexOf(','); // find the first comma
-  if(comma_index != -1) location = location.substring(0, comma_index); // take text before comma
-  lv_label_set_text(lbl_city, location.c_str());
+  location_ui = prefs.getString("location", "");
+  int comma_index = location_ui.indexOf(','); // find the first comma
+  if(comma_index != -1) location_ui = location_ui.substring(0, comma_index); // take text before comma
+  lv_label_set_text(lbl_city, location_ui.c_str());
 
   lv_obj_align(lbl_city, LV_ALIGN_TOP_LEFT, lbl_city_x, lbl_city_y);
 }
@@ -718,6 +719,10 @@ static void location_save_event_cb(lv_event_t *e) {
   // Re‐fetch weather immediately
   lv_label_set_text(lbl_loc, opts.c_str());
   fetch_and_update_weather();
+  location_ui = prefs.getString("location", "");
+  int comma_index = location_ui.indexOf(','); // find the first comma
+  if(comma_index != -1) location_ui = location_ui.substring(0, comma_index); // take text before comma
+  lv_label_set_text(lbl_city, location_ui.c_str());
 
   lv_obj_del(location_win);
   location_win = nullptr;
@@ -1107,6 +1112,17 @@ void create_settings_window() {
   lv_obj_set_style_text_font(lbl_chg, font_med, 0);
   lv_obj_center(lbl_chg);
 
+  // Hidden keyboard object
+  if (!kb || !lv_obj_is_valid(kb)) {
+    kb = lv_keyboard_create(lv_scr_act());    
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);            
+    lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    lv_buttonmatrix_set_button_ctrl(kb, 12, LV_BUTTONMATRIX_CTRL_HIDDEN); // Hide ABC
+    lv_buttonmatrix_set_button_ctrl(kb, 22, LV_BUTTONMATRIX_CTRL_HIDDEN); // Hide new line
+    lv_obj_add_event_cb(kb, kb_event_cb, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(kb, kb_event_cb, LV_EVENT_CANCEL, NULL);
+  }
+
   // Current location label below the button
   lbl_loc = lv_label_create(cont);
   lv_label_set_text(lbl_loc, location.c_str());
@@ -1114,7 +1130,7 @@ void create_settings_window() {
   lv_obj_set_height(lbl_loc, lbl_h); // FIXED
   lv_obj_align_to(lbl_loc, btn_change_loc, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 5);
 
-  // 8. Reset WiFi button
+  // Reset WiFi button
   lv_obj_t *btn_reset = lv_btn_create(cont);
   lv_obj_set_style_bg_color(btn_reset, lv_palette_main(LV_PALETTE_RED), 0);
   lv_obj_set_size(btn_reset, btn_w, btn_h);
@@ -1124,16 +1140,6 @@ void create_settings_window() {
   lv_label_set_text(lbl_reset, strings->reset_wifi);
   lv_obj_set_style_text_font(lbl_reset, font_med, 0);
   lv_obj_center(lbl_reset);
-
-  // 9. Hidden keyboard object
-  if (!kb) {
-    kb = lv_keyboard_create(lv_scr_act());                
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
-    lv_buttonmatrix_set_button_ctrl(kb, 12, LV_BUTTONMATRIX_CTRL_HIDDEN); // Hide ABC
-    lv_buttonmatrix_set_button_ctrl(kb, 22, LV_BUTTONMATRIX_CTRL_HIDDEN); // Hide new line
-    lv_obj_add_event_cb(kb, kb_event_cb, LV_EVENT_READY, NULL);
-    lv_obj_add_event_cb(kb, kb_event_cb, LV_EVENT_CANCEL, NULL);
-  }
 }
 
 static void settings_event_handler(lv_event_t *e) {
@@ -1152,13 +1158,18 @@ static void settings_event_handler(lv_event_t *e) {
     use_night_mode = lv_obj_has_state(night_mode_switch, LV_STATE_CHECKED);
   }
 
-
   // Handle rotation dropdown change
   if (tgt == rotation_dropdown && code == LV_EVENT_VALUE_CHANGED) {
     int selected = lv_dropdown_get_selected(rotation_dropdown);
     prefs.putUInt("rotation", selected);
     lv_obj_del(settings_win);
     settings_win = nullptr;
+
+    if (kb && lv_obj_is_valid(kb)) {
+      lv_keyboard_set_textarea(kb, nullptr);
+      lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    }
+
     lv_obj_clean(lv_scr_act());
     create_ui();
     fetch_and_update_weather();
@@ -1177,11 +1188,11 @@ static void settings_event_handler(lv_event_t *e) {
     prefs.putBool("useNightMode", use_night_mode);
     prefs.putUInt("language", current_language);
 
-    if (kb) {
-        lv_keyboard_set_textarea(kb, nullptr);
-        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    if (kb && lv_obj_is_valid(kb)) {
+      lv_keyboard_set_textarea(kb, nullptr);
+      lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
     }
-    
+
     // Recreate the main UI with the new language
     lv_obj_clean(lv_scr_act());
     create_ui();
@@ -1195,11 +1206,9 @@ static void settings_event_handler(lv_event_t *e) {
     prefs.putBool("useNightMode", use_night_mode);
     prefs.putUInt("language", current_language);
 
-    // Check if kb exists, break its link, then delete it.
-    if (kb != nullptr) {
-        lv_keyboard_set_textarea(kb, nullptr); // Important: break link first!
-        lv_obj_del(kb); // Free the memory
-        kb = nullptr; // Reset the pointer to prevent reuse
+    if (kb && lv_obj_is_valid(kb)) {
+      lv_keyboard_set_textarea(kb, nullptr);
+      lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
     }
 
     lv_obj_del(settings_win);
