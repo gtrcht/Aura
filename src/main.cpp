@@ -171,7 +171,7 @@ LV_IMG_DECLARE(image_sunny);
 LV_IMG_DECLARE(image_tornado);
 LV_IMG_DECLARE(image_wintry_mix_rain_snow);
 
-void create_ui();
+void create_weather_aura_ui();
 void fetch_and_update_weather();
 void create_settings_window();
 static void screen_event_cb(lv_event_t *e);
@@ -401,7 +401,7 @@ void setup() {
   lv_timer_create(update_clock, 1000, NULL);
 
   lv_obj_clean(lv_scr_act());
-  create_ui();
+  create_weather_aura_ui();
   fetch_and_update_weather();
 }
 
@@ -417,6 +417,7 @@ void apModeCallback(WiFiManager *mgr) {
   wifi_splash_screen();
   flush_wifi_splashscreen();
 }
+
 
 void loop() {
   lv_timer_handler();
@@ -467,7 +468,7 @@ void wifi_splash_screen() {
   lv_scr_load(scr);
 }
 
-void create_ui() {
+void create_weather_aura_ui() {
   lv_obj_t *scr = lv_scr_act();
   lv_obj_set_style_bg_color(scr, lv_color_hex(0x4c8cb9), LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_bg_grad_color(scr, lv_color_hex(0xa6cdec), LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -1171,7 +1172,7 @@ static void settings_event_handler(lv_event_t *e) {
     }
 
     lv_obj_clean(lv_scr_act());
-    create_ui();
+    create_weather_aura_ui();
     fetch_and_update_weather();
     return;
   }
@@ -1195,7 +1196,7 @@ static void settings_event_handler(lv_event_t *e) {
 
     // Recreate the main UI with the new language
     lv_obj_clean(lv_scr_act());
-    create_ui();
+    create_weather_aura_ui();
     fetch_and_update_weather();
     return;
   }
